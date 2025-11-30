@@ -16,7 +16,7 @@ use iroh::{
 };
 use rb::{RB, RbConsumer, RbProducer};
 use std::str::FromStr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 
 mod args;
 
@@ -175,8 +175,9 @@ async fn connect_to_server(
     let mut send = connection.open_uni().await?;
     send.write_u32(config.sample_rate().0).await?;
     send.write_u16(config.channels()).await?;
+    let mut send = BufWriter::new(send);
     println!(
-        "Connected to server:\nSample rate: {}\nChannels: {}",
+        "Connected to server:\n  Sample rate: {}\n  Channels: {}",
         config.sample_rate().0,
         config.channels()
     );
@@ -191,16 +192,15 @@ async fn connect_to_server(
         None,
     )?;
     stream.play()?;
+
     let mut buffer = vec![0f32; config.sample_rate().0 as usize];
     let mut counter: u32 = 0;
     loop {
-        let len = match rx.read(&mut buffer) {
-            Ok(val) => val,
-            Err(_) => continue,
-        };
-        if buffer[..len].iter().all(|v| v == &f32::EQUILIBRIUM) {
+        let len = rx.read_blocking(&mut buffer).unwrap();
+        let buffer = &buffer[..len];
+        if buffer.iter().all(|v| v == &f32::EQUILIBRIUM) {
             counter += len as u32;
-            //  Allow 1s zeros
+            //  Allow 1s silence, then stop sending stream
             if counter >= config.sample_rate().0 {
                 send.write_f32(f32::EQUILIBRIUM).await?;
                 continue;
@@ -208,12 +208,9 @@ async fn connect_to_server(
         } else {
             counter = 0;
         }
-        //  Read f32 buffer as u8 buffer to send over network
-        let bytes: Vec<u8> = buffer[..len]
-            .iter()
-            .flat_map(|val| val.to_be_bytes())
-            .collect();
-        send.write_all(&bytes).await?;
+        for val in buffer {
+            send.write_f32(*val).await?;
+        }
     }
 }
 
@@ -271,7 +268,7 @@ fn get_output_device(
     Ok(SendStream(dev.build_output_stream(
         &config,
         move |data: &mut [f32], _| {
-            _ = rx.read(data);
+            rx.read_blocking(data);
         },
         |err| {
             eprintln!("{err}");
@@ -285,8 +282,9 @@ async fn handle_connection(accept: Incoming, output: Option<&str>) -> anyhow::Re
     let mut read = conn.accept_uni().await?;
     let sample_rate = read.read_u32().await?;
     let channels = read.read_u16().await?;
+    let mut read = BufReader::new(read);
     println!(
-        "Got client:\nSample Rate: {}\nChannels: {}",
+        "Got client:\n  Sample Rate: {}\n  Channels: {}",
         sample_rate, channels
     );
 
@@ -296,14 +294,9 @@ async fn handle_connection(accept: Incoming, output: Option<&str>) -> anyhow::Re
     let stream = get_output_device(rx, output, SampleRate(sample_rate), channels)?;
     stream.0.play()?;
 
-    let mut buffer = vec![0u8; sample_rate as usize * size_of::<f32>()];
     loop {
-        let len = read.read(&mut buffer).await?.unwrap_or_default();
-        let values: Vec<_> = buffer[..len]
-            .chunks_exact(size_of::<f32>())
-            .map(|b| f32::from_be_bytes(b.try_into().unwrap()))
-            .collect();
-        _ = tx.write(&values);
+        let val = read.read_f32().await?;
+        _ = tx.write(&[val]);
     }
 }
 
