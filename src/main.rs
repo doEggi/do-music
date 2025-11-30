@@ -93,51 +93,53 @@ async fn main() -> anyhow::Result<()> {
 
             Ok(())
         }
-        Command::Client { name, input } => client(&name, input.as_deref()).await,
+        Command::Client {
+            name,
+            input,
+            bitrate,
+        } => client(&name, input.as_deref(), bitrate).await,
         Command::Server { name, output } => server(&name, output).await,
     }
 }
 
-async fn client(name: &str, input: Option<&str>) -> anyhow::Result<()> {
+async fn client(name: &str, input: Option<&str>, bitrate: Option<u32>) -> anyhow::Result<()> {
     let name = format!("{}{}", USER_DATA_NAME_PREFIX, name);
-    let mut last_endpoint = None;
+    let endpoint = Endpoint::empty_builder(iroh::RelayMode::Disabled)
+        .bind()
+        .await?;
+    let discovery = MdnsDiscovery::builder()
+        .advertise(false)
+        .service_name(SERVICE_NAME)
+        .build(endpoint.id())?;
+
     loop {
-        let endpoint = Endpoint::empty_builder(iroh::RelayMode::Disabled)
-            .bind()
-            .await?;
-        let discovery = MdnsDiscovery::builder()
-            .advertise(false)
-            .service_name(SERVICE_NAME)
-            .build(endpoint.id())?;
-
-        let stream = discovery.subscribe().await;
+        let stream = discovery.subscribe().await.filter_map(|event| {
+            let res = match event {
+                DiscoveryEvent::Discovered { endpoint_info, .. }
+                    if endpoint_info
+                        .user_data()
+                        .is_some_and(|ud| ud.to_string() == name) =>
+                {
+                    Some(endpoint_info.into_endpoint_addr())
+                }
+                _ => None,
+            };
+            async move { res }
+        });
         futures_util::pin_mut!(stream);
-
-        while let Some(DiscoveryEvent::Discovered {
-            endpoint_info: info,
-            ..
-        }) = stream.next().await
-        {
-            if info
-                .user_data()
-                .is_some_and(|data| data.to_string() != name)
-            {
-                continue;
-            }
-            if last_endpoint.is_some_and(|end| info.endpoint_id != end) {
-                println!("Warning: Server Identity changed!");
-            }
-            last_endpoint = Some(info.endpoint_id);
-            match connect_to_server(&endpoint, info.into_endpoint_addr(), input).await {
+        if let Some(addr) = stream.next().await {
+            match connect_to_server(&endpoint, addr, input, bitrate).await {
                 Ok(()) => unreachable!(),
                 Err(err) => eprintln!("{err}"),
             }
-            break;
         }
     }
 }
 
-fn get_cpal_input_stuff(name: Option<&str>) -> anyhow::Result<(Device, SupportedStreamConfig)> {
+fn get_cpal_input_stuff(
+    name: Option<&str>,
+    bitrate: Option<u32>,
+) -> anyhow::Result<(Device, SupportedStreamConfig)> {
     let host = cpal::default_host();
     let dev = match name {
         Some(name) => host
@@ -152,9 +154,12 @@ fn get_cpal_input_stuff(name: Option<&str>) -> anyhow::Result<(Device, Supported
     };
     let config = dev
         .supported_input_configs()?
+        .filter_map(|conf| match bitrate {
+            Some(bitrate) => conf.try_with_sample_rate(SampleRate(bitrate)),
+            None => Some(conf.with_max_sample_rate()),
+        })
         .next()
-        .context("No valid config for input device")?
-        .with_max_sample_rate();
+        .context("No valid config for input device")?;
 
     Ok((dev, config))
 }
@@ -163,8 +168,9 @@ async fn connect_to_server(
     endpoint: &Endpoint,
     server: EndpointAddr,
     input: Option<&str>,
+    bitrate: Option<u32>,
 ) -> anyhow::Result<()> {
-    let (device, config) = get_cpal_input_stuff(input)?;
+    let (device, config) = get_cpal_input_stuff(input, bitrate)?;
     let connection = endpoint.connect(server, ALPN).await?;
     let mut send = connection.open_uni().await?;
     send.write_u32(config.sample_rate().0).await?;
@@ -179,32 +185,35 @@ async fn connect_to_server(
     let stream = device.build_input_stream(
         &config.config(),
         move |data: &[f32], _info: &InputCallbackInfo| {
-            tx.write_blocking(data);
+            _ = tx.write(data);
         },
         move |err| eprintln!("{err}"),
         None,
     )?;
     stream.play()?;
     let mut buffer = vec![0f32; config.sample_rate().0 as usize];
+    let mut counter: u32 = 0;
     loop {
         let len = match rx.read(&mut buffer) {
             Ok(val) => val,
             Err(_) => continue,
         };
         if buffer[..len].iter().all(|v| v == &f32::EQUILIBRIUM) {
-            send.write_u32(0).await?;
-            continue;
+            counter += len as u32;
+            //  Allow 1s zeros
+            if counter >= config.sample_rate().0 {
+                send.write_f32(f32::EQUILIBRIUM).await?;
+                continue;
+            }
+        } else {
+            counter = 0;
         }
-        send.write_u32(len as u32).await?;
         //  Read f32 buffer as u8 buffer to send over network
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                buffer.as_ptr() as *const u8,
-                len * std::mem::size_of::<f32>() / std::mem::size_of::<u8>(),
-            )
-        };
-        send.write_all(bytes).await?;
-        //println!("Sent {} bytes", len * 4);
+        let bytes: Vec<u8> = buffer[..len]
+            .iter()
+            .flat_map(|val| val.to_be_bytes())
+            .collect();
+        send.write_all(&bytes).await?;
     }
 }
 
@@ -262,8 +271,7 @@ fn get_output_device(
     Ok(SendStream(dev.build_output_stream(
         &config,
         move |data: &mut [f32], _| {
-            rx.read_blocking(data).unwrap_or_default();
-            //data[len..].fill(f32::EQUILIBRIUM);
+            _ = rx.read(data);
         },
         |err| {
             eprintln!("{err}");
@@ -288,21 +296,14 @@ async fn handle_connection(accept: Incoming, output: Option<&str>) -> anyhow::Re
     let stream = get_output_device(rx, output, SampleRate(sample_rate), channels)?;
     stream.0.play()?;
 
+    let mut buffer = vec![0u8; sample_rate as usize * size_of::<f32>()];
     loop {
-        let len = read.read_u32().await?;
-        if len == 0 {
-            continue;
-        }
-        let mut buffer = vec![0f32; len as usize];
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                buffer.as_mut_ptr() as *mut u8,
-                len as usize * std::mem::size_of::<f32>() / std::mem::size_of::<u8>(),
-            )
-        };
-        read.read_exact(bytes).await?;
-        //println!("Got {} bytes", bytes.len());
-        tx.write_blocking(&buffer);
+        let len = read.read(&mut buffer).await?.unwrap_or_default();
+        let values: Vec<_> = buffer[..len]
+            .chunks_exact(size_of::<f32>())
+            .map(|b| f32::from_be_bytes(b.try_into().unwrap()))
+            .collect();
+        _ = tx.write(&values);
     }
 }
 

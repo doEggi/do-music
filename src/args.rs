@@ -10,15 +10,17 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     Client {
-        #[arg(short, long)]
+        #[arg(short = 'n', long)]
         name: String,
-        #[arg(short, long)]
+        #[arg(short = 'd', long)]
         input: Option<String>,
+        #[arg(short = 'b', long)]
+        bitrate: Option<u32>,
     },
     Server {
-        #[arg(short, long)]
+        #[arg(short = 'n', long)]
         name: String,
-        #[arg(short, long)]
+        #[arg(short = 'd', long)]
         output: Option<String>,
     },
     List,
