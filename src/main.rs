@@ -1,217 +1,255 @@
-use std::{convert::Infallible, time::Duration};
-
 use crate::args::{Cli, Command};
-use anyhow::bail;
+use anyhow::Context;
 use clap::Parser;
 use cpal::{
-    SampleRate,
+    SampleFormat, SampleRate,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use rb::{RB, RbConsumer, RbProducer};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+use futures_util::StreamExt;
+use iroh::{
+    Endpoint, EndpointAddr,
+    discovery::{
+        EndpointInfo, UserData,
+        mdns::{DiscoveryEvent, MdnsDiscovery},
+    },
+    endpoint::Connection,
 };
+use rb::{RB, RbConsumer, RbProducer};
+use std::{convert::Infallible, str::FromStr, sync::Arc};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod args;
 
-const PORT: u16 = 7350;
-const SAMPLE_RATE: usize = 48_000;
+const ALPN: &[u8] = b"do/music";
+const SAMPLE_RATE: u32 = 48_000;
 const MAX_OPUS_PACKET_SIZE: usize = 1500;
-const BITRATE: i32 = 128_000;
+const OPUS_MS: usize = 5;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<Infallible> {
     let args = Cli::parse();
     match args.cmd {
-        Command::Client { address, input } => client_loop(&address, input.as_deref()).await,
-        Command::Server { address, output } => {
-            server(
-                address
-                    .as_deref()
-                    .unwrap_or(const_format::formatcp!("0.0.0.0:{}", PORT)),
-                output,
-            )
-            .await
-        }
+        Command::Client { name, input } => client(name, input).await,
+        Command::Server { name, output } => server(name, output).await,
     }
 }
 
-async fn client_loop(address: &str, input: Option<&str>) -> ! {
+async fn server(name: String, device: Option<String>) -> anyhow::Result<Infallible> {
+    let endpoint = Endpoint::empty_builder(iroh::RelayMode::Disabled)
+        .alpns(vec![ALPN.to_vec()])
+        .user_data_for_discovery(UserData::from_str(&name)?)
+        .bind()
+        .await?;
+    endpoint.discovery().add(
+        MdnsDiscovery::builder()
+            .advertise(true)
+            .build(endpoint.id())?,
+    );
     loop {
-        let Err(err) = client(address, input).await;
-        eprintln!("{:?}", err);
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let connection = match endpoint.accept().await {
+            Some(val) => val,
+            None => continue,
+        }
+        .await?;
+        let device = device.clone();
+        tokio::spawn(async move {
+            let Err(err) = handle_connection(connection, device).await;
+            eprintln!("Error connecting to client:\n  {}", err);
+        });
     }
 }
 
-async fn client(address: &str, input: Option<&str>) -> anyhow::Result<Infallible> {
-    let (dev, config) = {
-        let host = cpal::default_host();
-        if let Some(val) = match input {
-            Some(name) => host
-                .input_devices()
-                .ok()
-                .and_then(|mut devices| {
-                    devices.find(|dev| dev.name().is_ok_and(|dev_name| dev_name == name))
-                })
-                .and_then(|dev| {
-                    dev.supported_input_configs().ok().and_then(|configs| {
-                        configs
-                            .filter_map(|conf| {
-                                conf.try_with_sample_rate(SampleRate(SAMPLE_RATE as u32))
-                            })
-                            .filter(|conf| matches!(conf.channels(), 1 | 2))
-                            .next()
-                            .map(|conf| (dev, conf))
-                    })
-                }),
-            None => host.default_input_device().and_then(|dev| {
-                dev.supported_input_configs().ok().and_then(|configs| {
-                    configs
-                        .filter_map(|conf| {
-                            conf.try_with_sample_rate(SampleRate(SAMPLE_RATE as u32))
-                        })
-                        .filter(|conf| matches!(conf.channels(), 1 | 2))
-                        .next()
-                        .map(|conf| (dev, conf))
-                })
-            }),
-        } {
-            val
-        } else {
-            bail!("Could not open input device")
+async fn handle_connection(
+    connection: Connection,
+    device: Option<String>,
+) -> anyhow::Result<Infallible> {
+    let mut rx = connection.accept_uni().await?;
+    let channels = match rx.read_u8().await? {
+        1 => 1u16,
+        2 => 2u16,
+        channels => {
+            return Err(anyhow::Error::msg(format!(
+                "Invalid channel count: {}",
+                channels
+            )));
         }
     };
-    let mut enc = opus::Encoder::new(
-        SAMPLE_RATE as u32,
-        if config.channels() == 1 {
-            opus::Channels::Mono
-        } else {
-            opus::Channels::Stereo
+    drop(rx);
+    let device = {
+        let host = cpal::default_host();
+        match device {
+            Some(dev_name) => host
+                .output_devices()?
+                .find(|dev| dev.name().is_ok_and(|name| name == dev_name)),
+            None => host.default_output_device(),
+        }
+        .context("Output device not found")?
+    };
+    let config = device
+        .supported_output_configs()?
+        .filter(|conf| conf.channels() == channels && conf.sample_format() == SampleFormat::F32)
+        .filter_map(|conf| conf.try_with_sample_rate(SampleRate(SAMPLE_RATE)))
+        .next()
+        .context("Output device does not support config")?;
+    //  Buffer for 100ms
+    let rb = Arc::new(rb::SpscRb::new(
+        SAMPLE_RATE as usize * channels as usize * 100 / 1_000,
+    ));
+    let rb_ = rb.clone();
+    let (rtx, rrx) = (rb.producer(), rb.consumer());
+    let stream = SendStream(device.build_output_stream(
+        &config.config(),
+        move |mut data: &mut [f32], _| {
+            data.fill(0.);
+            while data.len() > 0 {
+                let len = rrx.read_blocking(&mut data).unwrap_or_default();
+                data = &mut data[len..];
+            }
         },
-        opus::Application::Audio,
+        move |err| {
+            eprintln!("Error writing to output device:\n  {}", err);
+            rb_.clear();
+        },
+        None,
+    )?);
+    stream.0.play()?;
+    let mut dec = opus::Decoder::new(
+        SAMPLE_RATE,
+        match channels {
+            1 => opus::Channels::Mono,
+            2 => opus::Channels::Stereo,
+            _ => unreachable!(),
+        },
     )?;
-    enc.set_inband_fec(false)?;
-    enc.set_bitrate(opus::Bitrate::Bits(BITRATE))?;
-    enc.set_vbr(true)?;
-    let mut tcp = TcpStream::connect(address).await?;
-    tcp.write_u16(config.channels()).await?;
-    if tcp.read_u8().await? != 0 {
-        bail!("Invalid server response");
+
+    //let mut recv_buffer = [0u8; MAX_OPUS_PACKET_SIZE];
+    let mut sample_buffer = vec![0f32; SAMPLE_RATE as usize * channels as usize * OPUS_MS / 1000];
+    let mut seq: Option<u64> = None;
+
+    loop {
+        let recv_buffer = connection.read_datagram().await?;
+        let new_seq = u64::from_be_bytes(recv_buffer[0..8].try_into().unwrap());
+        if seq.is_some_and(|seq| seq >= new_seq) {
+            //  We alraydy skipped this package
+            continue;
+        }
+        while seq.is_none_or(|seq| seq + 1 < new_seq) {
+            dec.decode_float(&[], &mut sample_buffer, true)?;
+            _ = rtx.write(&sample_buffer);
+            seq = Some(seq.unwrap_or_default() + 1);
+        }
+        dec.decode_float(&recv_buffer[8..], &mut sample_buffer, false)?;
+        let len = rtx.write(&sample_buffer).unwrap_or_default();
+        if len != sample_buffer.len() {
+            rb.clear();
+        }
+        seq = Some(seq.unwrap_or_default() + 1);
     }
+}
 
-    let rb = rb::SpscRb::new(SAMPLE_RATE * config.channels() as usize);
-    let (tx, rx) = (rb.producer(), rb.consumer());
+async fn client(name: String, device: Option<String>) -> anyhow::Result<Infallible> {
+    let endpoint = Endpoint::empty_builder(iroh::RelayMode::Disabled)
+        .bind()
+        .await?;
 
-    let stream = SendStream(dev.build_input_stream(
+    loop {
+        let Err(err) = client_loop(&name, device.as_deref(), &endpoint).await;
+        eprintln!("Error connecting to server:\n  {}", err);
+    }
+}
+
+async fn client_loop(
+    name: &str,
+    device: Option<&str>,
+    endpoint: &Endpoint,
+) -> anyhow::Result<Infallible> {
+    let discovery = MdnsDiscovery::builder()
+        .advertise(false)
+        .build(endpoint.id())?;
+    let mut stream = discovery.subscribe().await;
+    let server_id = loop {
+        match stream.next().await {
+            Some(DiscoveryEvent::Discovered {
+                endpoint_info: EndpointInfo { data, endpoint_id },
+                ..
+            }) if data
+                .user_data()
+                .is_some_and(|data| data.to_string() == name) =>
+            {
+                break EndpointAddr::from_parts(endpoint_id, data.addrs().cloned());
+            }
+            _ => continue,
+        }
+    };
+    let connection = endpoint.connect(server_id, ALPN).await?;
+    let device = {
+        let host = cpal::default_host();
+        match device {
+            Some(dev_name) => host
+                .input_devices()?
+                .find(|dev| dev.name().is_ok_and(|name| &name == dev_name)),
+            None => host.default_input_device(),
+        }
+        .context("Input device not found")?
+    };
+    let config = device
+        .supported_input_configs()?
+        .filter(|conf| {
+            matches!(conf.channels(), 1 | 2) && conf.sample_format() == SampleFormat::F32
+        })
+        .filter_map(|conf| conf.try_with_sample_rate(SampleRate(SAMPLE_RATE)))
+        .max_by(|a, b| a.channels().cmp(&b.channels()))
+        .context("Input device does not support config")?;
+    let mut tx = connection.open_uni().await?;
+    tx.write_u8(config.channels() as u8).await?;
+    tx.finish()?;
+    //  Buffer for 100ms
+    let rb = Arc::new(rb::SpscRb::new(
+        SAMPLE_RATE as usize * config.channels() as usize * 100 / 1_000,
+    ));
+    let rb_ = rb.clone();
+    let (rtx, rrx) = (rb.producer(), rb.consumer());
+    let stream = SendStream(device.build_input_stream(
         &config.config(),
         move |mut data: &[f32], _| {
-            while let Some(len) = tx.write_blocking(data) {
+            while data.len() > 0 {
+                let len = rtx.write_blocking(data).unwrap_or_default();
                 data = &data[len..];
             }
         },
-        |err| eprintln!("{:?}", err),
+        move |err| {
+            eprintln!("Error reading input device:\n  {}", err);
+            rb_.clear();
+        },
         None,
     )?);
     stream.0.play()?;
-
-    //  2.5ms buffer
-    let mut buffer = vec![0f32; SAMPLE_RATE * 25 / 10_000 * config.channels() as usize];
-    let mut opus_buffer = [0u8; MAX_OPUS_PACKET_SIZE];
-    loop {
-        let mut buf: &mut [f32] = &mut buffer;
-        while let Some(len) = rx.read_blocking(&mut buf) {
-            buf = &mut buf[len..];
-        }
-        let len = enc.encode_float(&buffer, &mut opus_buffer)?;
-        tcp.write_u32(len as u32).await?;
-        tcp.write_all(&opus_buffer[..len]).await?;
-        tcp.flush().await?;
-    }
-}
-
-async fn server(address: &str, output: Option<String>) -> anyhow::Result<Infallible> {
-    loop {
-        let tcp = TcpListener::bind(address).await?;
-
-        while let Ok((con, addr)) = tcp.accept().await {
-            println!("Got connection: {}", addr);
-            let output = output.clone();
-            tokio::spawn(async move {
-                let Err(err) = handle_client(con, output.as_deref()).await;
-                eprintln!("Lost connection with {}", addr);
-                eprintln!("{:?}", err);
-            });
-        }
-    }
-}
-
-async fn handle_client(mut tcp: TcpStream, output: Option<&str>) -> anyhow::Result<Infallible> {
-    let channels = tcp.read_u16().await?;
-    if !matches!(channels, 1 | 2) {
-        bail!("Invalid channel count");
-    }
-
-    let rb = rb::SpscRb::new(SAMPLE_RATE * channels as usize);
-    let (tx, rx) = (rb.producer(), rb.consumer());
-
-    let dev = {
-        let host = cpal::default_host();
-        if let Some(val) = match output {
-            Some(name) => host.output_devices().ok().and_then(|mut devices| {
-                devices.find(|dev| dev.name().is_ok_and(|dev_name| dev_name == name))
-            }),
-            None => host.default_output_device(),
-        } {
-            val
-        } else {
-            bail!("Could not open output device")
-        }
-    };
-    let config = cpal::StreamConfig {
-        buffer_size: cpal::BufferSize::Default,
-        channels,
-        sample_rate: SampleRate(SAMPLE_RATE as u32),
-    };
-
-    let stream = SendStream(dev.build_output_stream(
-        &config,
-        move |data: &mut [f32], _| {
-            let len = rx.read(data).unwrap_or_default();
-            data[len..].fill(0f32);
-        },
-        |err| eprintln!("{:?}", err),
-        None,
-    )?);
-    stream.0.play()?;
-
-    let mut dec = opus::Decoder::new(
-        SAMPLE_RATE as u32,
-        if channels == 1 {
-            opus::Channels::Mono
-        } else {
-            opus::Channels::Stereo
-        },
+    let mut enc = opus::Encoder::new(
+        SAMPLE_RATE,
+        opus::Channels::Stereo,
+        opus::Application::Audio,
     )?;
+    enc.set_bitrate(opus::Bitrate::Max)?;
+    enc.set_inband_fec(true)?;
+    enc.set_packet_loss_perc(10)?;
+    enc.set_complexity(10)?;
+    enc.set_dtx(false)?;
 
-    tcp.write_u8(0).await?;
-
-    let mut opus_buffer = [0u8; MAX_OPUS_PACKET_SIZE];
-    let mut sample_buffer = vec![0f32; SAMPLE_RATE * 25 / 10_000 * channels as usize];
+    let mut sample_buffer =
+        vec![0f32; SAMPLE_RATE as usize * config.channels() as usize * OPUS_MS / 1000];
+    let mut seq = 1u64;
 
     loop {
-        let len = tcp.read_u32().await? as usize;
-        tcp.read_exact(&mut opus_buffer[..len]).await?;
-        dec.decode_float(&opus_buffer[..len], &mut sample_buffer, false)?;
-        //  Skip null buffer to reduce delay on pause / mute
-        if sample_buffer.iter().all(|sample| sample == &0f32) {
-            continue;
+        let mut buffer = &mut sample_buffer[..];
+        while buffer.len() > 0 {
+            let len = rrx.read_blocking(&mut buffer).unwrap_or_default();
+            buffer = &mut buffer[len..];
         }
-        let mut buf: &[f32] = &sample_buffer;
-        while let Some(len) = tx.write_blocking(buf) {
-            buf = &buf[len..];
-        }
+        let mut samples_buffer = enc.encode_vec_float(&sample_buffer, MAX_OPUS_PACKET_SIZE)?;
+        let mut buffer = seq.to_be_bytes().to_vec();
+        buffer.append(&mut samples_buffer);
+        connection.send_datagram(buffer.into())?;
+        seq += 1;
     }
 }
 

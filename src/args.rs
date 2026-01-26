@@ -10,14 +10,14 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     Client {
-        #[arg(short = 'a', long)]
-        address: String,
+        #[arg(short = 'n', long)]
+        name: String,
         #[arg(short = 'i', long)]
         input: Option<String>,
     },
     Server {
-        #[arg(short = 'a', long)]
-        address: Option<String>,
+        #[arg(short = 'n', long)]
+        name: String,
         #[arg(short = 'o', long)]
         output: Option<String>,
     },
