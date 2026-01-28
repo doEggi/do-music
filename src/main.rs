@@ -15,7 +15,7 @@ use iroh::{
     endpoint::Connection,
 };
 use rb::{RB, RbConsumer, RbProducer};
-use std::{convert::Infallible, str::FromStr, sync::Arc};
+use std::{convert::Infallible, str::FromStr, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod args;
@@ -143,7 +143,7 @@ async fn handle_connection(
         if len != sample_buffer.len() {
             rb.clear();
         }
-        seq = Some(seq.unwrap_or_default() + 1);
+        seq = Some(new_seq);
     }
 }
 
@@ -158,27 +158,40 @@ async fn client(name: String, device: Option<String>) -> anyhow::Result<Infallib
     }
 }
 
+async fn search_device(name: &str, endpoint: &Endpoint) -> Option<EndpointAddr> {
+    let discovery = MdnsDiscovery::builder()
+        .advertise(false)
+        .build(endpoint.id())
+        .ok()?;
+    let mut stream = discovery.subscribe().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match stream.next().await {
+                Some(DiscoveryEvent::Discovered {
+                    endpoint_info: EndpointInfo { data, endpoint_id },
+                    ..
+                }) if data
+                    .user_data()
+                    .is_some_and(|data| data.to_string() == name) =>
+                {
+                    return EndpointAddr::from_parts(endpoint_id, data.addrs().cloned());
+                }
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
 async fn client_loop(
     name: &str,
     device: Option<&str>,
     endpoint: &Endpoint,
 ) -> anyhow::Result<Infallible> {
-    let discovery = MdnsDiscovery::builder()
-        .advertise(false)
-        .build(endpoint.id())?;
-    let mut stream = discovery.subscribe().await;
     let server_id = loop {
-        match stream.next().await {
-            Some(DiscoveryEvent::Discovered {
-                endpoint_info: EndpointInfo { data, endpoint_id },
-                ..
-            }) if data
-                .user_data()
-                .is_some_and(|data| data.to_string() == name) =>
-            {
-                break EndpointAddr::from_parts(endpoint_id, data.addrs().cloned());
-            }
-            _ => continue,
+        if let Some(server_id) = search_device(name, endpoint).await {
+            break server_id;
         }
     };
     let connection = endpoint.connect(server_id, ALPN).await?;
