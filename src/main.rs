@@ -14,9 +14,12 @@ use iroh::{
     },
     endpoint::Connection,
 };
-use rb::{RB, RbConsumer, RbProducer};
+use rb::{RB, RbConsumer, RbInspector, RbProducer};
 use std::{convert::Infallible, str::FromStr, sync::Arc, time::Duration};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::mpsc::unbounded_channel,
+};
 
 mod args;
 
@@ -216,23 +219,30 @@ async fn client_loop(
     let mut tx = connection.open_uni().await?;
     tx.write_u8(config.channels() as u8).await?;
     tx.finish()?;
-    //  Buffer for 100ms
-    let rb = Arc::new(rb::SpscRb::new(
-        SAMPLE_RATE as usize * config.channels() as usize * 100 / 1_000,
-    ));
-    let rb_ = rb.clone();
+    let rb = rb::SpscRb::new(SAMPLE_RATE as usize * config.channels() as usize * OPUS_MS / 1000);
     let (rtx, rrx) = (rb.producer(), rb.consumer());
+    let mut rbuf = vec![0f32; SAMPLE_RATE as usize * config.channels() as usize * OPUS_MS / 1000]
+        .into_boxed_slice();
+    let (tx, mut rx) = unbounded_channel();
     let stream = SendStream(device.build_input_stream(
         &config.config(),
         move |mut data: &[f32], _| {
             while data.len() > 0 {
-                let len = rtx.write_blocking(data).unwrap_or_default();
-                data = &data[len..];
+                match rtx.write(&data) {
+                    Ok(len) => data = &data[len..],
+                    Err(rb::RbError::Full) => {
+                        assert_eq!(
+                            rrx.read(&mut rbuf).unwrap(),
+                            SAMPLE_RATE as usize * config.channels() as usize * OPUS_MS / 1000
+                        );
+                        tx.send(rbuf.clone());
+                    }
+                    _ => unreachable!(),
+                }
             }
         },
         move |err| {
             eprintln!("Error reading input device:\n  {}", err);
-            rb_.clear();
         },
         None,
     )?);
@@ -248,20 +258,19 @@ async fn client_loop(
     enc.set_complexity(10)?;
     enc.set_dtx(false)?;
 
-    let mut sample_buffer =
-        vec![0f32; SAMPLE_RATE as usize * config.channels() as usize * OPUS_MS / 1000];
+    let mut opus_buffer: [u8; MAX_OPUS_PACKET_SIZE + size_of::<u64>()] =
+        [0u8; MAX_OPUS_PACKET_SIZE + size_of::<u64>()];
     let mut seq = 1u64;
 
     loop {
-        let mut buffer = &mut sample_buffer[..];
-        while buffer.len() > 0 {
-            let len = rrx.read_blocking(&mut buffer).unwrap_or_default();
-            buffer = &mut buffer[len..];
-        }
-        let mut samples_buffer = enc.encode_vec_float(&sample_buffer, MAX_OPUS_PACKET_SIZE)?;
-        let mut buffer = seq.to_be_bytes().to_vec();
-        buffer.append(&mut samples_buffer);
-        connection.send_datagram(buffer.into())?;
+        let buf = rx.recv().await.context("Stream crashed")?;
+        seq.to_be_bytes()
+            .into_iter()
+            .enumerate()
+            .for_each(|(i, b)| opus_buffer[i] = b);
+
+        let len = enc.encode_float(&buf, &mut opus_buffer[size_of::<u64>()..])?;
+        connection.send_datagram(opus_buffer[..len + size_of::<u64>()].to_vec().into())?;
         seq += 1;
     }
 }
