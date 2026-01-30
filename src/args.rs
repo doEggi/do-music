@@ -14,6 +14,13 @@ pub enum Command {
         name: String,
         #[arg(short = 'i', long)]
         input: Option<String>,
+        #[arg(
+            short = 'l',
+            long,
+            long_help = "Low latency mode. Might affect quality",
+            default_value = "false"
+        )]
+        low_latency: bool,
     },
     Server {
         #[arg(short = 'n', long)]

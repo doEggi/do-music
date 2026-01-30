@@ -32,7 +32,11 @@ const OPUS_MS: usize = 5;
 async fn main() -> anyhow::Result<Infallible> {
     let args = Cli::parse();
     match args.cmd {
-        Command::Client { name, input } => client(name, input).await,
+        Command::Client {
+            name,
+            input,
+            low_latency,
+        } => client(name, input, low_latency).await,
         Command::Server { name, output } => server(name, output).await,
     }
 }
@@ -150,13 +154,17 @@ async fn handle_connection(
     }
 }
 
-async fn client(name: String, device: Option<String>) -> anyhow::Result<Infallible> {
+async fn client(
+    name: String,
+    device: Option<String>,
+    low_latency: bool,
+) -> anyhow::Result<Infallible> {
     let endpoint = Endpoint::empty_builder(iroh::RelayMode::Disabled)
         .bind()
         .await?;
 
     loop {
-        let Err(err) = client_loop(&name, device.as_deref(), &endpoint).await;
+        let Err(err) = client_loop(&name, device.as_deref(), &endpoint, low_latency).await;
         eprintln!("Error connecting to server:\n  {}", err);
     }
 }
@@ -191,6 +199,7 @@ async fn client_loop(
     name: &str,
     device: Option<&str>,
     endpoint: &Endpoint,
+    low_latency: bool,
 ) -> anyhow::Result<Infallible> {
     let server_id = loop {
         if let Some(server_id) = search_device(name, endpoint).await {
@@ -250,7 +259,11 @@ async fn client_loop(
     let mut enc = opus::Encoder::new(
         SAMPLE_RATE,
         opus::Channels::Stereo,
-        opus::Application::Audio,
+        if low_latency {
+            opus::Application::LowDelay
+        } else {
+            opus::Application::Audio
+        },
     )?;
     enc.set_bitrate(opus::Bitrate::Max)?;
     enc.set_inband_fec(true)?;
