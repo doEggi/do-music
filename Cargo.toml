@@ -10,7 +10,7 @@ license = "MIT"
 anyhow = "1.0.100"
 clap = { version = "4.5.53", features = ["derive"] }
 const_format = "0.2.35"
-cpal = "0.17.1"
+cpal = "0.16.0"
 futures-util = "0.3.31"
 iroh = "0.96.1"
 opus = "0.3.0"

@@ -111,7 +111,7 @@ async fn handle_connection(
         match device {
             Some(name) => host
                 .output_devices()?
-                .find(|dev| dev.description().is_ok_and(|desc| desc.name() == name)),
+                .find(|dev| dev.name().is_ok_and(|name_| name_ == name)),
             None => host.default_output_device(),
         }
         .context("Output device not found")?
@@ -119,7 +119,7 @@ async fn handle_connection(
     let config = device
         .supported_output_configs()?
         .filter(|conf| conf.channels() == channels && conf.sample_format() == SampleFormat::F32)
-        .filter_map(|conf| conf.try_with_sample_rate(SAMPLE_RATE))
+        .filter_map(|conf| conf.try_with_sample_rate(cpal::SampleRate(SAMPLE_RATE)))
         .next()
         .context("Output device does not support config")?;
     //  Buffer for 100ms
@@ -244,7 +244,7 @@ async fn client_loop(
         match device {
             Some(name) => host
                 .input_devices()?
-                .find(|dev| dev.description().is_ok_and(|desc| desc.name() == name)),
+                .find(|dev| dev.name().is_ok_and(|name_| name_ == name)),
             None => host.default_input_device(),
         }
         .context("Input device not found")?
@@ -254,7 +254,7 @@ async fn client_loop(
         .filter(|conf| {
             matches!(conf.channels(), 1 | 2) && conf.sample_format() == SampleFormat::F32
         })
-        .filter_map(|conf| conf.try_with_sample_rate(SAMPLE_RATE))
+        .filter_map(|conf| conf.try_with_sample_rate(cpal::SampleRate(SAMPLE_RATE)))
         .max_by(|a, b| a.channels().cmp(&b.channels()))
         .context("Input device does not support config")?;
     let mut tx = connection.open_uni().await?;
