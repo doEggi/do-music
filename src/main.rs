@@ -174,7 +174,7 @@ async fn client_loop(
         },
     )?;
     encoder.set_bitrate(opus::Bitrate::Max)?;
-    encoder.set_inband_fec(true)?;
+    encoder.set_inband_fec(false)?;
     encoder.set_packet_loss_perc(10)?;
     encoder.set_complexity(10)?;
     encoder.set_dtx(false)?;
@@ -312,11 +312,11 @@ async fn handle_connection(
         {
             for i in 1..diff {
                 println!("lost package {}", seq.unwrap() + i);
-                let len = decoder.decode_float(&[], &mut sample_buffer, true)?;
+                let len = decoder.decode_float(&[], &mut sample_buffer, false)?;
                 rtx.push_slice(&sample_buffer[..len * channels as usize]);
             }
         }
-        let len = decoder.decode_float(&datagram[8..], &mut sample_buffer, true)?;
+        let len = decoder.decode_float(&datagram[8..], &mut sample_buffer, false)?;
         rtx.push_slice(&sample_buffer[..len * channels as usize]);
         seq = Some(new_seq);
     }
