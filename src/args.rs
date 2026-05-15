@@ -1,5 +1,9 @@
 use crate::DEFAULT_PORT;
-use std::net::{SocketAddr, ToSocketAddrs};
+use clap::ValueEnum;
+use std::{
+    fmt::Display,
+    net::{SocketAddr, ToSocketAddrs},
+};
 
 #[derive(clap::Parser)]
 #[command(version, about = "A simple opus music stream between two devices", long_about = None)]
@@ -15,10 +19,10 @@ pub enum Command {
         input: Option<String>,
         #[arg(short, long, value_parser = parse_to_socket_addr)]
         address: SocketAddr,
-        #[arg(short = 'l', long, default_value_t = false)]
-        low_latency: bool,
-        #[arg(long, default_value_t = 10., value_parser = parse_opus_ms)]
-        opus_ms: f32,
+        #[arg(short, long, default_value = "audio")]
+        opus_mode: Application,
+        #[arg(short, long, value_parser = clap::value_parser!(u16).range(1..=2))]
+        channels: Option<u16>,
     },
     Server {
         #[arg(short, long)]
@@ -43,13 +47,29 @@ fn parse_to_socket_addr(s: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| "No address resolved".into())
 }
 
-fn parse_opus_ms(s: &str) -> Result<f32, String> {
-    let opus_ms: f32 = s.parse().map_err(|err| format!("{:?}", err))?;
-    if !matches!(opus_ms, 2.5 | 5. | 10. | 20. | 40. | 60.) {
-        return Err(format!(
-            "invalid opus_ms value: {}\nHas to be one of [2.5, 5, 10, 20, 40, 60]",
-            opus_ms
-        ));
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum Application {
+    Voip,
+    Audio,
+    LowDelay,
+}
+
+impl From<Application> for opus::Application {
+    fn from(value: Application) -> Self {
+        match value {
+            Application::Voip => Self::Voip,
+            Application::Audio => Self::Audio,
+            Application::LowDelay => Self::LowDelay,
+        }
     }
-    Ok(opus_ms)
+}
+
+impl Display for Application {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Voip => f.write_str("VoIp"),
+            Self::Audio => f.write_str("Audio"),
+            Self::LowDelay => f.write_str("LowDelay"),
+        }
+    }
 }
