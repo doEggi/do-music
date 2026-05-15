@@ -276,7 +276,13 @@ async fn handle_connection(
                 &config,
                 move |data: &mut [f32], _| {
                     let len = rrx.pop_slice(data);
-                    data[len..].fill(cpal::Sample::EQUILIBRIUM);
+                    if len >= 2 {
+                        //  Fill rest of the buffer with last known value
+                        let last_samples: [f32; 2] = data[len - 2..len].try_into().unwrap();
+                        data[len..]
+                            .chunks_exact_mut(2)
+                            .for_each(|ch| ch.copy_from_slice(&last_samples));
+                    }
                 },
                 |err| eprintln!("cpal error: {:?}", err),
                 None,
