@@ -81,7 +81,11 @@ async fn client(
     endpoint.set_default_client_config(client_config);
 
     loop {
-        let connection = endpoint.connect(address, "do-music")?.await?;
+        let connection = match endpoint.connect(address, "do-music")?.await {
+            Ok(val) => val,
+            Err(quinn::ConnectionError::TimedOut) => continue,
+            Err(err) => return Err(err.into()),
+        };
         tokio::select! {
             res = connection.read_datagram() => match res {
                 Ok(_) => eprintln!("Got datagram from server (this is bad)"),
@@ -160,8 +164,9 @@ async fn client_loop(
         },
         opus_mode,
     )?;
-    encoder.set_bitrate(opus::Bitrate::Max)?;
-    encoder.set_inband_fec(false)?;
+    encoder.set_bitrate(opus::Bitrate::Bits(96000))?;
+    encoder.set_inband_fec(true)?;
+    encoder.set_signal(opus::Signal::Music)?;
     encoder.set_packet_loss_perc(10)?;
     encoder.set_complexity(10)?;
     encoder.set_vbr(true)?;
@@ -275,14 +280,15 @@ async fn handle_connection(
             .build_output_stream(
                 &config,
                 move |data: &mut [f32], _| {
-                    let len = rrx.pop_slice(data);
-                    if len >= 2 {
-                        //  Fill rest of the buffer with last known value
-                        let last_samples: [f32; 2] = data[len - 2..len].try_into().unwrap();
-                        data[len..]
-                            .chunks_exact_mut(2)
-                            .for_each(|ch| ch.copy_from_slice(&last_samples));
-                    }
+                    /*let len = */
+                    rrx.pop_slice(data);
+                    //if len >= 2 {
+                    //    //  Fill rest of the buffer with last known value
+                    //    let last_samples: [f32; 2] = data[len - 2..len].try_into().unwrap();
+                    //    data[len..]
+                    //        .chunks_exact_mut(2)
+                    //        .for_each(|ch| ch.copy_from_slice(&last_samples));
+                    //}
                 },
                 |err| eprintln!("cpal error: {:?}", err),
                 None,
