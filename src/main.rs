@@ -1,7 +1,10 @@
 use crate::{cert::SkipServerVerification, stream::MyStream};
 use anyhow::{Context, bail};
 use clap::Parser;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{
+    StreamConfig,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+};
 use quinn::{
     ClientConfig, Connection, Endpoint, Incoming, ServerConfig, TransportConfig,
     crypto::rustls::QuicClientConfig,
@@ -267,28 +270,19 @@ async fn handle_connection(
         }
         let device = device.unwrap();
         println!("Using output device \"{}\"", device.description()?.name());
-        let config = device
-            .supported_output_configs()?
-            .filter(|config| {
-                config.channels() == channels && config.sample_format() == cpal::SampleFormat::F32
-            })
-            .filter_map(|config| config.try_with_sample_rate(SAMPLE_RATE))
-            .next()
-            .context("Output device does not support config")?
-            .config();
+        let config = StreamConfig {
+            channels,
+            sample_rate: SAMPLE_RATE,
+            buffer_size: cpal::BufferSize::Default,
+        };
         device
             .build_output_stream(
                 &config,
-                move |data: &mut [f32], _| {
-                    /*let len = */
-                    rrx.pop_slice(data);
-                    //if len >= 2 {
-                    //    //  Fill rest of the buffer with last known value
-                    //    let last_samples: [f32; 2] = data[len - 2..len].try_into().unwrap();
-                    //    data[len..]
-                    //        .chunks_exact_mut(2)
-                    //        .for_each(|ch| ch.copy_from_slice(&last_samples));
-                    //}
+                move |mut data: &mut [f32], _| {
+                    while !data.is_empty() {
+                        let len = rrx.pop_slice(data);
+                        data = &mut data[len..];
+                    }
                 },
                 |err| eprintln!("cpal error: {:?}", err),
                 None,
@@ -317,6 +311,5 @@ async fn handle_connection(
         rx.read_exact(&mut opus_buffer[..len]).await?;
         let len = decoder.decode_float(&opus_buffer[..len], &mut sample_buffer, false)?;
         rtx.push_slice(&sample_buffer[..len * channels as usize]);
-        //println!("Pushed {} samples", len * channels as usize);
     }
 }
