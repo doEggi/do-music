@@ -23,6 +23,10 @@ pub enum Command {
         opus_mode: Application,
         #[arg(short, long, value_parser = clap::value_parser!(u16).range(1..=2))]
         channels: Option<u16>,
+        #[arg(short, long)]
+        bitrate: Option<i32>,
+        #[arg(short, long, default_value_t = true)]
+        vbr: bool,
     },
     Server {
         #[arg(short, long)]

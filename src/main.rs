@@ -55,7 +55,9 @@ async fn main() -> anyhow::Result<Infallible> {
             address,
             opus_mode,
             channels,
-        } => client(input, address, opus_mode.into(), channels).await,
+            bitrate,
+            vbr,
+        } => client(input, address, opus_mode.into(), channels, bitrate, vbr).await,
         args::Command::Server { output, bind } => server(output, bind).await,
     }
 }
@@ -65,6 +67,8 @@ async fn client(
     address: SocketAddr,
     opus_mode: opus::Application,
     channels: Option<u16>,
+    bitrate: Option<i32>,
+    vbr: bool,
 ) -> anyhow::Result<Infallible> {
     assert!(matches!(channels, None | Some(1 | 2)));
 
@@ -94,7 +98,7 @@ async fn client(
                 Ok(_) => eprintln!("Got datagram from server (this is bad)"),
                 Err(err) => eprintln!("{:?}", err),
             },
-            Err(err) = client_loop(&input, &connection, opus_mode, channels) => eprintln!("{:?}", err),
+            Err(err) = client_loop(&input, &connection, opus_mode, channels, bitrate, vbr) => eprintln!("{:?}", err),
         };
         tokio::time::sleep(Duration::from_millis(CLIENT_WAIT_MS)).await;
     }
@@ -105,6 +109,8 @@ async fn client_loop(
     connection: &Connection,
     opus_mode: opus::Application,
     channels: Option<u16>,
+    bitrate: Option<i32>,
+    vbr: bool,
 ) -> anyhow::Result<Infallible> {
     let host = cpal::default_host();
     let device = match input {
@@ -154,7 +160,7 @@ async fn client_loop(
     stream.play()?;
 
     let mut tx = connection.open_uni().await?;
-    //  Todo: Write sample rate
+    tx.write_i32(bitrate.unwrap_or(-1)).await?;
     tx.write_i32(opus_mode as i32).await?;
     tx.write_u16(channels).await?;
 
@@ -167,12 +173,16 @@ async fn client_loop(
         },
         opus_mode,
     )?;
-    encoder.set_bitrate(opus::Bitrate::Bits(96000))?;
-    encoder.set_inband_fec(true)?;
+    encoder.set_bitrate(
+        bitrate
+            .map(|b| opus::Bitrate::Bits(b))
+            .unwrap_or(opus::Bitrate::Max),
+    )?;
+    encoder.set_inband_fec(false)?;
     encoder.set_signal(opus::Signal::Music)?;
-    encoder.set_packet_loss_perc(10)?;
+    encoder.set_packet_loss_perc(0)?;
     encoder.set_complexity(10)?;
-    encoder.set_vbr(true)?;
+    encoder.set_vbr(vbr)?;
     encoder.set_dtx(false)?;
 
     let mut opus_buffer = [0u8; MAX_OPUS_PACKAGE_SIZE];
@@ -197,7 +207,7 @@ async fn server(output: Option<String>, bind: Option<SocketAddr>) -> anyhow::Res
         transport_config.max_concurrent_bidi_streams(0_u8.into());
         transport_config.max_concurrent_uni_streams(1_u8.into());
         transport_config
-            .max_idle_timeout(Some(Duration::from_secs(5).try_into().unwrap())) // Max. 30s ohne Aktivität
+            .max_idle_timeout(Some(Duration::from_secs(5).try_into().unwrap()))
             .keep_alive_interval(Some(Duration::from_secs(3)));
 
         Endpoint::server(
@@ -230,7 +240,12 @@ async fn handle_connection(
     println!("Got connection from {}", connection.remote_address());
     let mut rx = connection.accept_uni().await?;
 
-    //  TODO: Read bitrate
+    let bitrate = rx.read_i32().await?;
+    if bitrate == i32::MIN {
+        println!("Bitrate: max");
+    } else {
+        println!("Bitrate: {}", bitrate);
+    }
 
     let opus_mode = match rx.read_i32().await? {
         i if i == opus::Application::Voip as i32 => opus::Application::Voip,
