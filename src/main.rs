@@ -294,10 +294,7 @@ async fn handle_connection(
             .build_output_stream(
                 &config,
                 move |mut data: &mut [f32], _| {
-                    while !data.is_empty() {
-                        let len = rrx.pop_slice(data);
-                        data = &mut data[len..];
-                    }
+                    rrx.pop_slice(data);
                 },
                 |err| match err {
                     StreamError::BufferUnderrun => {}
