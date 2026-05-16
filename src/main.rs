@@ -294,7 +294,8 @@ async fn handle_connection(
             .build_output_stream(
                 &config,
                 move |data: &mut [f32], _| {
-                    if rrx.occupied_len() >= data.len() {
+                    let len = rrx.pop_slice(data);
+                    if (1..data.len()).contains(&len) {
                         rrx.pop_slice(data);
                     }
                 },
