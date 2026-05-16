@@ -2,7 +2,7 @@ use crate::{cert::SkipServerVerification, stream::MyStream};
 use anyhow::{Context, bail};
 use clap::Parser;
 use cpal::{
-    StreamConfig, StreamError,
+    OutputCallbackInfo, StreamConfig, StreamError,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use quinn::{
@@ -293,10 +293,10 @@ async fn handle_connection(
         device
             .build_output_stream(
                 &config,
-                move |data: &mut [f32], _| {
-                    let len = rrx.pop_slice(data);
-                    if (1..data.len()).contains(&len) {
-                        rrx.pop_slice(data);
+                move |mut data: &mut [f32], _| {
+                    while !data.is_empty() {
+                        let len = rrx.pop_slice(data);
+                        data = &mut data[len..];
                     }
                 },
                 |err| match err {
