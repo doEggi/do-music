@@ -1,164 +1,64 @@
 {
-  description = "Build a cargo project";
+  description = "Build a cargo project without extra checks";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-
     crane.url = "github:ipetkov/crane";
-
     flake-utils.url = "github:numtide/flake-utils";
-
-    advisory-db = {
-      url = "github:rustsec/advisory-db";
-      flake = false;
-    };
   };
 
-  outputs =
-    {
-      self,
-      nixpkgs,
-      crane,
-      flake-utils,
-      advisory-db,
-      ...
-    }:
+  outputs = {
+    self,
+    nixpkgs,
+    crane,
+    flake-utils,
+    ...
+  }:
     flake-utils.lib.eachDefaultSystem (
-      system:
-      let
+      system: let
         pkgs = nixpkgs.legacyPackages.${system};
-
-        inherit (pkgs) lib;
-
         craneLib = crane.mkLib pkgs;
-        src = craneLib.cleanCargoSource ./.;
-
-        # Common arguments can be set here to avoid repeating them later
         commonArgs = {
-          inherit src;
+          src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
-
-          buildInputs = [
-            # Add additional build inputs here
-            #pkgs.cmake
-            pkgs.libopus.dev
-          ]
-          ++ lib.optionals pkgs.stdenv.isDarwin [
-            # Additional darwin specific inputs can be set here
-            pkgs.libiconv
-          ]++ lib.optionals pkgs.stdenv.isLinux [
-            pkgs.alsa-lib.dev
+          buildInputs =
+            [
+              pkgs.pkg-config
+              pkgs.libopus.dev
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+              pkgs.libiconv
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux or pkgs.stdenv.isBSD [
+              pkgs.alsa-lib.dev
+            ];
+          nativeBuildInputs = [
+            pkgs.pkg-config
           ];
-
-          nativeBuildInputs = with pkgs; [
-            pkg-config
-          ];
-
-          # Additional environment variables can be set directly
-          # MY_CUSTOM_VAR = "some value";
-          #CMAKE_POLICY_VERSION_MINIMUM = "3.5";
         };
-
-        # Build *just* the cargo dependencies, so we can reuse
-        # all of that work (e.g. via cachix) when running in CI
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-
-        # Build the actual crate itself, reusing the dependency
-        # artifacts from above.
         do-music = craneLib.buildPackage (
           commonArgs
           // {
-            inherit cargoArtifacts;
+            cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+            # MY_CUSTOM_VAR = "some value";
           }
         );
-      in
-      {
+      in {
         checks = {
-          # Build the crate as part of `nix flake check` for convenience
           inherit do-music;
-
-          # Run clippy (and deny all warnings) on the crate source,
-          # again, reusing the dependency artifacts from above.
-          #
-          # Note that this is done as a separate derivation so that
-          # we can block the CI if there are issues here, but not
-          # prevent downstream consumers from building our crate by itself.
-          do-music-clippy = craneLib.cargoClippy (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-            }
-          );
-
-          do-music-doc = craneLib.cargoDoc (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              # This can be commented out or tweaked as necessary, e.g. set to
-              # `--deny rustdoc::broken-intra-doc-links` to only enforce that lint
-              env.RUSTDOCFLAGS = "--deny warnings";
-            }
-          );
-
-          # Check formatting
-          do-music-fmt = craneLib.cargoFmt {
-            inherit src;
-          };
-
-          do-music-toml-fmt = craneLib.taploFmt {
-            src = pkgs.lib.sources.sourceFilesBySuffices src [ ".toml" ];
-            # taplo arguments can be further customized below as needed
-            # taploExtraArgs = "--config ./taplo.toml";
-          };
-
-          # Audit dependencies
-          do-music-audit = craneLib.cargoAudit {
-            inherit src advisory-db;
-          };
-
-          # Audit licenses
-          do-music-deny = craneLib.cargoDeny {
-            inherit src;
-          };
-
-          # Run tests with cargo-nextest
-          # Consider setting `doCheck = false` on `do-music` if you do not want
-          # the tests to run twice
-          do-music-nextest = craneLib.cargoNextest (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              partitions = 1;
-              partitionType = "count";
-              cargoNextestPartitionsExtraArgs = "--no-tests=pass";
-            }
-          );
         };
-
-        packages = {
-          default = do-music;
-        };
-
+        packages.default = do-music;
         apps.default = flake-utils.lib.mkApp {
           drv = do-music;
         };
 
         devShells.default = craneLib.devShell {
-          # Inherit inputs from checks.
           checks = self.checks.${system};
 
-          # Additional dev-shell environment variables can be set directly
           # MY_CUSTOM_DEVELOPMENT_VAR = "something else";
-          RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
-          #CMAKE_POLICY_VERSION_MINIMUM = "3.5";
 
-          # Extra inputs can be added here; cargo and rustc are provided by default.
-          packages = [
-            # pkgs.ripgrep
-            pkgs.rustup
-            pkgs.rust-analyzer
-          ];
+          packages = [];
         };
       }
     );

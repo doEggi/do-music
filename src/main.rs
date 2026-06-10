@@ -2,7 +2,7 @@ use crate::{cert::SkipServerVerification, stream::MyStream};
 use anyhow::{Context, bail};
 use clap::Parser;
 use cpal::{
-    OutputCallbackInfo, StreamConfig, StreamError,
+    StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use quinn::{
@@ -115,7 +115,7 @@ async fn client_loop(
     let host = cpal::default_host();
     let device = match input {
         Some(name) => host.input_devices()?.map(|dev| dev).find(|dev| {
-            dev.id().is_ok_and(|id| &id.1 == name)
+            dev.id().is_ok_and(|id| &id.id() == name)
                 || dev.description().is_ok_and(|desc| desc.name() == name)
         }),
         None => host.default_input_device(),
@@ -142,7 +142,7 @@ async fn client_loop(
 
     let stream: MyStream = device
         .build_input_stream(
-            &config,
+            config,
             move |mut data: &[f32], _| {
                 while !data.is_empty() {
                     data = &data[rb.push_slice(&data)..];
@@ -275,7 +275,7 @@ async fn handle_connection(
         let host = cpal::default_host();
         let device = match output {
             Some(name) => host.output_devices()?.find(|dev| {
-                dev.id().is_ok_and(|id| &id.1 == name)
+                dev.id().is_ok_and(|id| &id.id() == name)
                     || dev.description().is_ok_and(|desc| desc.name() == name)
             }),
             None => host.default_output_device(),
@@ -292,14 +292,11 @@ async fn handle_connection(
         };
         device
             .build_output_stream(
-                &config,
-                move |mut data: &mut [f32], _| {
+                config,
+                move |data: &mut [f32], _| {
                     rrx.pop_slice(data);
                 },
-                |err| match err {
-                    StreamError::BufferUnderrun => {}
-                    err => eprintln!("cpal error: {:?}", err),
-                },
+                |err| eprintln!("cpal error: {:?}", err),
                 None,
             )?
             .into()
